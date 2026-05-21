@@ -518,6 +518,25 @@ struct Met{
     double getpnl()const{return pnl_up.load(std::memory_order_relaxed)/1e6;}
 };
 
+struct LatStat{
+    std::atomic<uint64_t> n{0};
+    std::atomic<uint64_t> us_total{0};
+    std::atomic<uint64_t> us_max{0};
+    void add_us(uint64_t us){
+        n.fetch_add(1,std::memory_order_relaxed);
+        us_total.fetch_add(us,std::memory_order_relaxed);
+        uint64_t cur=us_max.load(std::memory_order_relaxed);
+        while(cur<us&&!us_max.compare_exchange_weak(cur,us,std::memory_order_relaxed)){}
+    }
+    void snapshot_and_reset(uint64_t&out_n,double&out_avg_ms,double&out_max_ms){
+        out_n=n.exchange(0,std::memory_order_relaxed);
+        uint64_t total=us_total.exchange(0,std::memory_order_relaxed);
+        uint64_t umax=us_max.exchange(0,std::memory_order_relaxed);
+        out_avg_ms=out_n?((double)total/(double)out_n/1000.0):0.0;
+        out_max_ms=(double)umax/1000.0;
+    }
+};
+
 // ================================================================
 // BOT MARKET MAKER v18
 // ================================================================
@@ -614,6 +633,8 @@ private:
     static constexpr int REST_WORKERS=4;
     static constexpr size_t REST_QUEUE_MAX=2048;
     std::atomic<uint64_t> rest_jobs_dropeados_{0};
+    LatStat lat_rest_send_;
+    LatStat lat_rest_recv_;
 
     std::atomic<bool> run_{false},kill_{false};
     std::thread tr_,tq_,tg_,tm_;
@@ -1490,6 +1511,10 @@ private:
                         "pnl="+std::to_string(kv.second.pnl));
                 }
             }
+            uint64_t lat_n_send=0,lat_n_recv=0;
+            double lat_avg_send=0.0,lat_max_send=0.0,lat_avg_recv=0.0,lat_max_recv=0.0;
+            lat_rest_send_.snapshot_and_reset(lat_n_send,lat_avg_send,lat_max_send);
+            lat_rest_recv_.snapshot_and_reset(lat_n_recv,lat_avg_recv,lat_max_recv);
             std::ostringstream oo;
             oo<<std::fixed<<std::setprecision(4)
               <<"[10s] ticks="<<(nw-last_ticks)
@@ -1499,6 +1524,12 @@ private:
               <<" rest_q="<<rest_threads_.load()
               <<" rest_drop="<<rest_jobs_dropeados_.load()
               <<" inv_closes="<<met_.inv_closes.load()
+              <<" lat_send_n="<<lat_n_send
+              <<" lat_send_avg_ms="<<lat_avg_send
+              <<" lat_send_max_ms="<<lat_max_send
+              <<" lat_recv_n="<<lat_n_recv
+              <<" lat_recv_avg_ms="<<lat_avg_recv
+              <<" lat_recv_max_ms="<<lat_max_recv
               <<" pnl="<<met_.getpnl()<<" USD"
               <<" dia="<<pnl_dia_<<" USD"
               <<" kill="<<kill_.load();
@@ -1706,10 +1737,20 @@ private:
                 if(!rest_connected_||!rest_stream_){
                     rest_ioc_.restart();rest_connect_();
                 }
+                auto t0=std::chrono::steady_clock::now();
                 http::write(*rest_stream_,req);
+                auto t1=std::chrono::steady_clock::now();
                 beast::flat_buffer buf;
                 http::response<http::string_body> resp;
                 http::read(*rest_stream_,buf,resp);
+                auto t2=std::chrono::steady_clock::now();
+                uint64_t send_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+                uint64_t recv_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t2-t1).count();
+                lat_rest_send_.add_us(send_us);
+                lat_rest_recv_.add_us(recv_us);
+                log("LAT_REST path="+std::string(req.target())
+                    +" send_ms="+fmt_decimal(send_us/1000.0,3)
+                    +" recv_ms="+fmt_decimal(recv_us/1000.0,3));
                 if(resp[http::field::connection]=="close"){
                     rest_connected_=false;rest_stream_.reset();
                 }
