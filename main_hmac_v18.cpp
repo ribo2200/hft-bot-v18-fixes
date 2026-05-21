@@ -73,10 +73,12 @@
 #include<cstring>
 #include<deque>
 #include<fstream>
+#include<functional>
 #include<iomanip>
 #include<iostream>
 #include<memory>
 #include<mutex>
+#include<condition_variable>
 #include<pthread.h>
 #include<signal.h>
 #include<openssl/hmac.h>
@@ -191,6 +193,7 @@ static const char REST_LEVERAGE_GET[]= "/derivatives/api/v3/leveragepreferences"
 static const char WS_HOST[] = "futures.kraken.com";
 static const char WS_PORT[] = "443";
 static const char WS_PATH[] = "/ws/v1";
+static const char USER_AGENT[] = "HFT-MM/18.1";
 
 enum class Side{B,S};
 
@@ -235,6 +238,33 @@ inline std::string fmt_decimal(double v, int decimals){
 // ================================================================
 // FAST PARSER
 // ================================================================
+
+
+inline bool extraer_available_margin_flex(const std::string&resp,double&out_bal){
+    try{
+        json::value jv=json::parse(resp);
+        if(!jv.is_object())return false;
+        const auto& root=jv.as_object();
+        auto it_accounts=root.find("accounts");
+        if(it_accounts==root.end()||!it_accounts->value().is_object())return false;
+        const auto& accounts=it_accounts->value().as_object();
+        auto it_flex=accounts.find("flex");
+        if(it_flex==accounts.end()||!it_flex->value().is_object())return false;
+        const auto& flex=it_flex->value().as_object();
+        auto it_margin=flex.find("availableMargin");
+        if(it_margin==flex.end())return false;
+        const json::value& m=it_margin->value();
+        if(m.is_double()) out_bal=m.as_double();
+        else if(m.is_int64()) out_bal=(double)m.as_int64();
+        else if(m.is_uint64()) out_bal=(double)m.as_uint64();
+        else if(m.is_string()) out_bal=std::atof(std::string(m.as_string().c_str()).c_str());
+        else return false;
+        return out_bal>0;
+    }catch(const std::exception&ex){
+        (void)ex;
+        return false;
+    }
+}
 inline double fatof(const char*p)noexcept{
     double r=0;bool ng=(*p=='-');if(ng)++p;
     while(*p>='0'&&*p<='9'){r=r*10+(*p++-'0');}
@@ -488,6 +518,25 @@ struct Met{
     double getpnl()const{return pnl_up.load(std::memory_order_relaxed)/1e6;}
 };
 
+struct LatStat{
+    std::atomic<uint64_t> n{0};
+    std::atomic<uint64_t> us_total{0};
+    std::atomic<uint64_t> us_max{0};
+    void add_us(uint64_t us){
+        n.fetch_add(1,std::memory_order_relaxed);
+        us_total.fetch_add(us,std::memory_order_relaxed);
+        uint64_t cur=us_max.load(std::memory_order_relaxed);
+        while(cur<us&&!us_max.compare_exchange_weak(cur,us,std::memory_order_relaxed)){}
+    }
+    void snapshot_and_reset(uint64_t&out_n,double&out_avg_ms,double&out_max_ms){
+        out_n=n.exchange(0,std::memory_order_relaxed);
+        uint64_t total=us_total.exchange(0,std::memory_order_relaxed);
+        uint64_t umax=us_max.exchange(0,std::memory_order_relaxed);
+        out_avg_ms=out_n?((double)total/(double)out_n/1000.0):0.0;
+        out_max_ms=(double)umax/1000.0;
+    }
+};
+
 // ================================================================
 // BOT MARKET MAKER v18
 // ================================================================
@@ -515,6 +564,7 @@ public:
             +" | SKEW_AGRESIVO>="+std::to_string(SKEW_AGRESIVO_FRAC*100)+"%inv");
         log("Modo: "+std::string(live_?"LIVE":"SIM"));
         run_.store(true,std::memory_order_release);
+        iniciar_workers_rest_();
         if(live_){
             try{rest_connect_();}
             catch(const std::exception&ex){
@@ -557,8 +607,7 @@ public:
         if(tm_.joinable())tm_.join();
         // FIX 4: join del hilo de fills
         if(tf_.joinable())tf_.join();
-        for(int i=0;i<30&&rest_threads_.load()>0;++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        detener_workers_rest_();
         uint64_t total_ciclos=0;
         for(const auto&kv:quotes_)total_ciclos+=kv.second.ciclos;
         log("Detenido | PnL="+std::to_string(pnl_dia_)+" USD"
@@ -577,6 +626,15 @@ private:
     std::unique_ptr<RestStream> rest_stream_;
     bool rest_connected_=false;
     std::atomic<int> rest_threads_{0};
+    std::mutex rest_q_m_;
+    std::condition_variable rest_q_cv_;
+    std::deque<std::function<void()>> rest_q_;
+    std::vector<std::thread> rest_workers_;
+    static constexpr int REST_WORKERS=4;
+    static constexpr size_t REST_QUEUE_MAX=2048;
+    std::atomic<uint64_t> rest_jobs_dropeados_{0};
+    LatStat lat_rest_send_;
+    LatStat lat_rest_recv_;
 
     std::atomic<bool> run_{false},kill_{false};
     std::thread tr_,tq_,tg_,tm_;
@@ -614,6 +672,46 @@ private:
     std::string       chal_priv_{},schal_priv_{};
     std::thread       tf_;   // hilo dedicado fills WS privado
 
+    void iniciar_workers_rest_(){
+        for(int i=0;i<REST_WORKERS;i++){
+            rest_workers_.emplace_back([this]{
+                while(true){
+                    std::function<void()> job;
+                    {
+                        std::unique_lock<std::mutex> lk(rest_q_m_);
+                        rest_q_cv_.wait(lk,[this]{
+                            return !run_.load(std::memory_order_acquire)||!rest_q_.empty();
+                        });
+                        if(!run_.load(std::memory_order_acquire)&&rest_q_.empty())return;
+                        job=std::move(rest_q_.front());
+                        rest_q_.pop_front();
+                    }
+                    try{job();}
+                    catch(const std::exception&ex){log("REST_WORKER_ERR: "+std::string(ex.what()));}
+                    catch(...){log("REST_WORKER_ERR: excepcion desconocida");}
+                }
+            });
+        }
+    }
+    void detener_workers_rest_(){
+        rest_q_cv_.notify_all();
+        for(auto &w:rest_workers_) if(w.joinable()) w.join();
+        rest_workers_.clear();
+    }
+    void encolar_rest_job_(std::function<void()> job){
+        {
+            std::lock_guard<std::mutex> lk(rest_q_m_);
+            if(rest_q_.size()>=REST_QUEUE_MAX){
+                rest_jobs_dropeados_.fetch_add(1,std::memory_order_relaxed);
+                log("REST_Q_WARN: cola llena, job descartado");
+                return;
+            }
+            rest_q_.push_back(std::move(job));
+            rest_threads_.fetch_add(1,std::memory_order_relaxed);
+        }
+        rest_q_cv_.notify_one();
+    }
+
     ASEngine as_engine_;
 
     // ================================================================
@@ -650,7 +748,9 @@ private:
                 if(std::chrono::duration_cast<std::chrono::seconds>(
                     ahora_ping-ultimo_ping).count()>=30){
                     json::object ping;ping["event"]="ping";
-                    try{ws_->write(asio::buffer(json::serialize(ping)));}catch(...){}
+                    try{ws_->write(asio::buffer(json::serialize(ping)));}
+                    catch(const std::exception&ex){log("WS ping err: "+std::string(ex.what()));}
+                    catch(...){log("WS ping err: excepcion desconocida");}
                     ultimo_ping=ahora_ping;
                 }
                 ws_->read(buf);
@@ -663,7 +763,9 @@ private:
                 if(run_.load()){
                     log("WS err: "+std::string(ex.what()));
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    try{recon_();}catch(...){}
+                    try{recon_();}
+                    catch(const std::exception&rex){log("WS recon err: "+std::string(rex.what()));}
+                    catch(...){log("WS recon err: excepcion desconocida");}
                 }
             }
         }
@@ -1126,8 +1228,6 @@ private:
                     q.capas[ci].ask_px=ask_caps[ci];
                 }
                 q.rest_en_vuelo=true;
-                rest_threads_.fetch_add(1,std::memory_order_relaxed);
-
                 // Captura por valor de todo lo necesario para el hilo
                 std::string sym=q.sym;
                 double noc_c=q.nocional_capa;
@@ -1140,7 +1240,7 @@ private:
                 bool bid_ok=ofi_bid_ok,ask_ok=ofi_ask_ok;
 
                 // ── [REGLA 5] Hilo blindado con RAII + try-catch ──────────
-                std::thread([this,sym,noc_c,
+                encolar_rest_job_([this,sym,noc_c,
                              b0,b1,b2,a0,a1,a2,
                              ob0,ob1,ob2,oa0,oa1,oa2,
                              nb0,nb1,nb2,na0,na1,na2,
@@ -1157,7 +1257,6 @@ private:
                                 it2->second.ultimo_requote=
                                     std::chrono::steady_clock::now();
                             }
-                            bot->rest_threads_.fetch_sub(1,std::memory_order_relaxed);
                         }
                     } guard{this,sym};
 
@@ -1182,7 +1281,8 @@ private:
                         log("REST_ERR "+sym+": excepcion desconocida");
                     }
                     // RestGuard::~RestGuard() libera aquí ──────────────────
-                }).detach();
+                    rest_threads_.fetch_sub(1,std::memory_order_relaxed);
+                });
             }
         }
     }
@@ -1194,20 +1294,18 @@ private:
             Capa&c=q.capas[ci];
             if(c.bid_viva&&!c.bid_oid.empty()){
                 std::string oid=c.bid_oid;
-                rest_threads_.fetch_add(1,std::memory_order_relaxed);
-                std::thread([this,oid](){
-                    try{rest_cancelar_(oid);}catch(...){}
+                encolar_rest_job_([this,oid](){
+                    try{rest_cancelar_(oid);}catch(const std::exception&ex){log("CANCEL_ERR "+oid+": "+std::string(ex.what()));}catch(...){log("CANCEL_ERR "+oid+": excepcion desconocida");}
                     rest_threads_.fetch_sub(1,std::memory_order_relaxed);
-                }).detach();
+                });
                 c.bid_viva=false;c.bid_oid="";
             }
             if(c.ask_viva&&!c.ask_oid.empty()){
                 std::string oid=c.ask_oid;
-                rest_threads_.fetch_add(1,std::memory_order_relaxed);
-                std::thread([this,oid](){
-                    try{rest_cancelar_(oid);}catch(...){}
+                encolar_rest_job_([this,oid](){
+                    try{rest_cancelar_(oid);}catch(const std::exception&ex){log("CANCEL_ERR "+oid+": "+std::string(ex.what()));}catch(...){log("CANCEL_ERR "+oid+": excepcion desconocida");}
                     rest_threads_.fetch_sub(1,std::memory_order_relaxed);
-                }).detach();
+                });
                 c.ask_viva=false;c.ask_oid="";
             }
         }
@@ -1215,9 +1313,15 @@ private:
         std::string oid="cl"+std::to_string(seq_.fetch_add(1,std::memory_order_relaxed));
         // Precio de cierre — mismo cálculo en SIM y live
         double pnl_cierre=0;
-        if(q.inventory_usd>0&&q.precio_inv>0)
-            pnl_cierre=q.nocional_capa*(mid-q.precio_inv)/q.precio_inv
-                       -q.nocional_capa*FEE_TAKER;
+        if(q.precio_inv>0){
+            if(q.inventory_usd>0){
+                pnl_cierre=q.nocional_capa*(mid-q.precio_inv)/q.precio_inv
+                           -q.nocional_capa*FEE_TAKER;
+            }else if(q.inventory_usd<0){
+                pnl_cierre=q.nocional_capa*(q.precio_inv-mid)/q.precio_inv
+                           -q.nocional_capa*FEE_TAKER;
+            }
+        }
         q.pnl+=pnl_cierre;pnl_dia_+=pnl_cierre;
         met_.addpnl(pnl_cierre);
         met_.inv_closes.fetch_add(1,std::memory_order_relaxed);
@@ -1231,14 +1335,13 @@ private:
             q.capas[ci].ask_viva=false;
         }
         std::string sym=q.sym;
-        rest_threads_.fetch_add(1,std::memory_order_relaxed);
-        std::thread([this,sym,lado,size,oid](){
-            try{rest_mercado_(sym,lado,size,oid);}catch(...){}
+        encolar_rest_job_([this,sym,lado,size,oid](){
+            try{rest_mercado_(sym,lado,size,oid);}catch(const std::exception&ex){log("MKT_CLOSE_ERR "+sym+" oid="+oid+": "+std::string(ex.what()));}catch(...){log("MKT_CLOSE_ERR "+sym+" oid="+oid+": excepcion desconocida");}
             std::lock_guard<std::mutex>lk2(mq_);
             auto it2=quotes_.find(sym);
             if(it2!=quotes_.end())it2->second.inv_close_en_vuelo=false;
             rest_threads_.fetch_sub(1,std::memory_order_relaxed);
-        }).detach();
+        });
     }
 
     // ── Dead Man's Switch — renueva el timeout de cancelación cada 30s ─
@@ -1344,20 +1447,18 @@ private:
                 Capa&c=q.capas[ci];
                 if(c.bid_viva&&!c.bid_oid.empty()){
                     std::string oid=c.bid_oid;
-                    rest_threads_.fetch_add(1,std::memory_order_relaxed);
-                    std::thread([this,oid](){
-                        try{rest_cancelar_(oid);}catch(...){}
+                    encolar_rest_job_([this,oid](){
+                        try{rest_cancelar_(oid);}catch(const std::exception&ex){log("CANCEL_ERR "+oid+": "+std::string(ex.what()));}catch(...){log("CANCEL_ERR "+oid+": excepcion desconocida");}
                         rest_threads_.fetch_sub(1,std::memory_order_relaxed);
-                    }).detach();
+                    });
                     c.bid_viva=false;
                 }
                 if(c.ask_viva&&!c.ask_oid.empty()){
                     std::string oid=c.ask_oid;
-                    rest_threads_.fetch_add(1,std::memory_order_relaxed);
-                    std::thread([this,oid](){
-                        try{rest_cancelar_(oid);}catch(...){}
+                    encolar_rest_job_([this,oid](){
+                        try{rest_cancelar_(oid);}catch(const std::exception&ex){log("CANCEL_ERR "+oid+": "+std::string(ex.what()));}catch(...){log("CANCEL_ERR "+oid+": excepcion desconocida");}
                         rest_threads_.fetch_sub(1,std::memory_order_relaxed);
-                    }).detach();
+                    });
                     c.ask_viva=false;
                 }
             }
@@ -1376,21 +1477,24 @@ private:
                 balance_counter=0;
                 try{
                     std::string resp=rest_get_("/derivatives/api/v3/accounts");
-                    const char*p2=strstr(resp.c_str(),"flex");
-                    const char*p=p2?strstr(p2,"\"availableMargin\":"):nullptr;
-                    if(p){p+=18;double bal=atof(p);
-                        if(bal>0){
-                            // [REGLA 4] Actualizar EQUITY_ACTUAL con el
-                            // margen disponible real devuelto por Kraken.
-                            // En live esto refleja el patrimonio neto real
-                            // incluyendo posiciones abiertas valoradas por
-                            // el exchange, no nuestro cálculo local.
-                            set_equity(bal);
-                            log("BALANCE REAL: "+std::to_string(bal)
-                                +" USD | EQUITY_ACTUAL actualizado");
-                        }
+                    double bal=0.0;
+                    if(extraer_available_margin_flex(resp,bal)){
+                        // [REGLA 4] Actualizar EQUITY_ACTUAL con el
+                        // margen disponible real devuelto por Kraken.
+                        // En live esto refleja el patrimonio neto real
+                        // incluyendo posiciones abiertas valoradas por
+                        // el exchange, no nuestro cálculo local.
+                        set_equity(bal);
+                        log("BALANCE REAL: "+std::to_string(bal)
+                            +" USD | EQUITY_ACTUAL actualizado");
+                    }else{
+                        log("BALANCE_WARN: no se pudo parsear availableMargin.flex");
                     }
-                }catch(...){}
+                }catch(const std::exception&ex){
+                    log("BALANCE_ERR: "+std::string(ex.what()));
+                }catch(...){
+                    log("BALANCE_ERR: excepcion desconocida");
+                }
             }
             uint64_t nw=met_.ticks.load();
             uint64_t total_ciclos=0;
@@ -1407,13 +1511,25 @@ private:
                         "pnl="+std::to_string(kv.second.pnl));
                 }
             }
+            uint64_t lat_n_send=0,lat_n_recv=0;
+            double lat_avg_send=0.0,lat_max_send=0.0,lat_avg_recv=0.0,lat_max_recv=0.0;
+            lat_rest_send_.snapshot_and_reset(lat_n_send,lat_avg_send,lat_max_send);
+            lat_rest_recv_.snapshot_and_reset(lat_n_recv,lat_avg_recv,lat_max_recv);
             std::ostringstream oo;
             oo<<std::fixed<<std::setprecision(4)
               <<"[10s] ticks="<<(nw-last_ticks)
               <<" requotes="<<met_.requotes.load()
               <<" fills="<<met_.fills.load()
               <<" ciclos="<<total_ciclos
+              <<" rest_q="<<rest_threads_.load()
+              <<" rest_drop="<<rest_jobs_dropeados_.load()
               <<" inv_closes="<<met_.inv_closes.load()
+              <<" lat_send_n="<<lat_n_send
+              <<" lat_send_avg_ms="<<lat_avg_send
+              <<" lat_send_max_ms="<<lat_max_send
+              <<" lat_recv_n="<<lat_n_recv
+              <<" lat_recv_avg_ms="<<lat_avg_recv
+              <<" lat_recv_max_ms="<<lat_max_recv
               <<" pnl="<<met_.getpnl()<<" USD"
               <<" dia="<<pnl_dia_<<" USD"
               <<" kill="<<kill_.load();
@@ -1621,10 +1737,20 @@ private:
                 if(!rest_connected_||!rest_stream_){
                     rest_ioc_.restart();rest_connect_();
                 }
+                auto t0=std::chrono::steady_clock::now();
                 http::write(*rest_stream_,req);
+                auto t1=std::chrono::steady_clock::now();
                 beast::flat_buffer buf;
                 http::response<http::string_body> resp;
                 http::read(*rest_stream_,buf,resp);
+                auto t2=std::chrono::steady_clock::now();
+                uint64_t send_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
+                uint64_t recv_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t2-t1).count();
+                lat_rest_send_.add_us(send_us);
+                lat_rest_recv_.add_us(recv_us);
+                log("LAT_REST path="+std::string(req.target())
+                    +" send_ms="+fmt_decimal(send_us/1000.0,3)
+                    +" recv_ms="+fmt_decimal(recv_us/1000.0,3));
                 if(resp[http::field::connection]=="close"){
                     rest_connected_=false;rest_stream_.reset();
                 }
@@ -1633,7 +1759,9 @@ private:
                 log("REST reconectando: "+std::string(ex.what()));
                 rest_connected_=false;rest_stream_.reset();
                 if(intento==0){
-                    try{rest_ioc_.restart();rest_connect_();}catch(...){}
+                    try{rest_ioc_.restart();rest_connect_();}
+                    catch(const std::exception&rex){log("REST reconexion interna fallida: "+std::string(rex.what()));}
+                    catch(...){log("REST reconexion interna fallida: excepcion desconocida");}
                 }
             }
         }
@@ -1647,7 +1775,7 @@ private:
         std::string authent=rest_sign_("",nonce_str,path);
         http::request<http::string_body> req(http::verb::get,path,11);
         req.set(http::field::host,REST_HOST);
-        req.set(http::field::user_agent,"HFT-MM/16.0");
+        req.set(http::field::user_agent,USER_AGENT);
         req.set(http::field::connection,"keep-alive");
         req.set("APIKey",ak_);req.set("Nonce",nonce_str);req.set("Authent",authent);
         req.body()="";req.prepare_payload();
@@ -1684,7 +1812,7 @@ private:
         std::string authent=rest_sign_(encoded_body,nonce_str,path);
         http::request<http::string_body> req(http::verb::put,path,11);
         req.set(http::field::host,REST_HOST);
-        req.set(http::field::user_agent,"HFT-MM/11.0");
+        req.set(http::field::user_agent,USER_AGENT);
         req.set(http::field::content_type,"application/x-www-form-urlencoded");
         req.set(http::field::connection,"keep-alive");
         req.set("APIKey",ak_);req.set("Nonce",nonce_str);req.set("Authent",authent);
@@ -1700,7 +1828,7 @@ private:
         std::string authent=rest_sign_(encoded_body,nonce_str,path);
         http::request<http::string_body> req(http::verb::post,path,11);
         req.set(http::field::host,REST_HOST);
-        req.set(http::field::user_agent,"HFT-MM/11.0");
+        req.set(http::field::user_agent,USER_AGENT);
         req.set(http::field::content_type,"application/x-www-form-urlencoded");
         req.set(http::field::connection,"keep-alive");
         req.set("APIKey",ak_);req.set("Nonce",nonce_str);req.set("Authent",authent);
@@ -1742,7 +1870,7 @@ private:
         std::string authent=rest_sign_(body_encoded,nonce_str,path);
         http::request<http::string_body> req(http::verb::post,path,11);
         req.set(http::field::host,REST_HOST);
-        req.set(http::field::user_agent,"HFT-MM/11.0");
+        req.set(http::field::user_agent,USER_AGENT);
         req.set(http::field::content_type,"application/x-www-form-urlencoded");
         req.set(http::field::connection,"keep-alive");
         req.set("APIKey",ak_);req.set("Nonce",nonce_str);req.set("Authent",authent);
@@ -1949,7 +2077,7 @@ private:
         ws->set_option(websocket::stream_base::decorator(
             [host](websocket::request_type&req){
                 req.set(beast::http::field::host,host);
-                req.set(beast::http::field::user_agent,"HFT-MM/16.0");
+                req.set(beast::http::field::user_agent,USER_AGENT);
             }));
         ws->handshake(host,path);
         return ws;
