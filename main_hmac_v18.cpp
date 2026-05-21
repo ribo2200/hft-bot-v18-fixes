@@ -1937,12 +1937,11 @@ private:
     }
 
     std::string rest_post_batch_(const std::string&path,
-                                  const std::string&body,
-                                  const std::string&body_encoded){
+                                  const std::string&body){
         if(!live_){log("SIM BATCH "+path);return "{\"result\":\"success\"}";}
         std::lock_guard<std::mutex>lk(mrest_);
         std::string nonce_str=nonce_();
-        std::string authent=rest_sign_(body_encoded,nonce_str,path);
+        std::string authent=rest_sign_(body,nonce_str,path);
         http::request<http::string_body> req(http::verb::post,path,11);
         req.set(http::field::host,REST_HOST);
         req.set(http::field::user_agent,USER_AGENT);
@@ -2064,8 +2063,8 @@ private:
 
         json::object wrapper;wrapper["batchOrder"]=batch;
         std::string json_raw=json::serialize(wrapper);
-        std::string body="json="+json_raw;
-        std::string body_for_sign="json="+url_encode_(json_raw);
+        // Firmar exactamente el mismo body que se envía.
+        std::string body="json="+url_encode_(json_raw);
 
         log("BATCH_V9 "+sym
             +" capas="+std::to_string(N_CAPAS)
@@ -2074,7 +2073,7 @@ private:
             +" b1="+std::to_string(bid_pxs[0])
             +" a1="+std::to_string(ask_pxs[0]));
 
-        std::string resp=rest_post_batch_(REST_BATCH,body,body_for_sign);
+        std::string resp=rest_post_batch_(REST_BATCH,body);
 
         // ── Parseo de resultados por capa ─────────────────────────────
         {
