@@ -635,6 +635,11 @@ private:
     std::atomic<uint64_t> rest_jobs_dropeados_{0};
     LatStat lat_rest_send_;
     LatStat lat_rest_recv_;
+    LatStat lat_order_ack_;
+    LatStat lat_open_fill_;
+    LatStat lat_fill_close_;
+    std::mutex mlat_;
+    std::unordered_map<std::string,std::chrono::steady_clock::time_point> oid_sent_ts_;
 
     std::atomic<bool> run_{false},kill_{false};
     std::thread tr_,tq_,tg_,tm_;
@@ -819,6 +824,16 @@ private:
             // Fill cuando el precio toca o cruza el nivel
             // Mismo criterio que usaría Kraken en live
             if(c.bid_viva && tk.bid<=c.bid_px){
+                {
+                    std::lock_guard<std::mutex> lkl(mlat_);
+                    auto it_oid=oid_sent_ts_.find(c.bid_oid);
+                    if(it_oid!=oid_sent_ts_.end()){
+                        uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                            ahora_sim-it_oid->second).count();
+                        lat_open_fill_.add_us(dt_us);
+                        oid_sent_ts_.erase(it_oid);
+                    }
+                }
                 q.inventory_usd+=q.nocional_capa;
                 q.precio_inv=c.bid_px;
                 c.bid_viva=false;c.bid_oid="";
@@ -832,9 +847,20 @@ private:
                 check_ciclo_(q);
             }
             if(c.ask_viva && tk.ask>=c.ask_px){
+                {
+                    std::lock_guard<std::mutex> lkl(mlat_);
+                    auto it_oid=oid_sent_ts_.find(c.ask_oid);
+                    if(it_oid!=oid_sent_ts_.end()){
+                        uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                            ahora_sim-it_oid->second).count();
+                        lat_open_fill_.add_us(dt_us);
+                        oid_sent_ts_.erase(it_oid);
+                    }
+                }
                 q.inventory_usd-=q.nocional_capa;
                 c.ask_viva=false;c.ask_oid="";
                 q.fills_ask++;met_.fills.fetch_add(1,std::memory_order_relaxed);
+                q.ultimo_fill=ahora_sim;
                 log("SIM_FILL ASK capa"+std::to_string(i+1)+" "+q.sym
                     +" px="+std::to_string(c.ask_px)
                     +" lat="+std::to_string(ms_desde_requote)+"ms"
@@ -895,6 +921,16 @@ private:
                 bool am=(c.ask_oid==sid||(!cli_sid.empty()&&c.ask_oid==cli_sid));
                 if(bm&&c.bid_viva){
                     double px=fill_px>0?fill_px:c.bid_px;
+                    {
+                        std::lock_guard<std::mutex> lkl(mlat_);
+                        auto it_oid=oid_sent_ts_.find(c.bid_oid);
+                        if(it_oid!=oid_sent_ts_.end()){
+                            uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now()-it_oid->second).count();
+                            lat_open_fill_.add_us(dt_us);
+                            oid_sent_ts_.erase(it_oid);
+                        }
+                    }
                     q.inventory_usd+=q.nocional_capa;
                     q.precio_inv=px;
                     c.bid_viva=false;c.bid_oid="";
@@ -908,8 +944,19 @@ private:
                 }
                 if(am&&c.ask_viva){
                     double px=fill_px>0?fill_px:c.ask_px;
+                    {
+                        std::lock_guard<std::mutex> lkl(mlat_);
+                        auto it_oid=oid_sent_ts_.find(c.ask_oid);
+                        if(it_oid!=oid_sent_ts_.end()){
+                            uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now()-it_oid->second).count();
+                            lat_open_fill_.add_us(dt_us);
+                            oid_sent_ts_.erase(it_oid);
+                        }
+                    }
                     q.inventory_usd-=q.nocional_capa;
                     c.ask_viva=false;c.ask_oid="";
+                    q.ultimo_fill=std::chrono::steady_clock::now();
                     q.fills_ask++;met_.fills.fetch_add(1,std::memory_order_relaxed);
                     log("FILL ASK capa"+std::to_string(ci+1)+" "+q.sym
                         +" px="+std::to_string(px)
@@ -955,6 +1002,11 @@ private:
             peak_=std::max(peak_,CAP+pnl_dia_);
             met_.ciclos.fetch_add(1,std::memory_order_relaxed);
             met_.addpnl(pnl_neto);
+            if(q.ultimo_fill.time_since_epoch().count()>0){
+                uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-q.ultimo_fill).count();
+                lat_fill_close_.add_us(dt_us);
+            }
             log("CICLO "+q.sym
                 +" spread="+std::to_string(spread_cap*100)+"%"
                 +" pnl="+std::to_string(pnl_neto)+" USD"
@@ -1226,6 +1278,14 @@ private:
                     q.capas[ci].ask_viva=(ofi_ask_ok);
                     q.capas[ci].bid_px=bid_caps[ci];
                     q.capas[ci].ask_px=ask_caps[ci];
+                }
+                {
+                    std::lock_guard<std::mutex> lkl(mlat_);
+                    auto ts_now=std::chrono::steady_clock::now();
+                    for(int ci=0;ci<N_CAPAS;ci++){
+                        oid_sent_ts_[new_boids[ci]]=ts_now;
+                        oid_sent_ts_[new_aoids[ci]]=ts_now;
+                    }
                 }
                 q.rest_en_vuelo=true;
                 // Captura por valor de todo lo necesario para el hilo
@@ -1515,6 +1575,12 @@ private:
             double lat_avg_send=0.0,lat_max_send=0.0,lat_avg_recv=0.0,lat_max_recv=0.0;
             lat_rest_send_.snapshot_and_reset(lat_n_send,lat_avg_send,lat_max_send);
             lat_rest_recv_.snapshot_and_reset(lat_n_recv,lat_avg_recv,lat_max_recv);
+            uint64_t lat_n_ack=0,lat_n_open_fill=0,lat_n_fill_close=0;
+            double lat_avg_ack=0.0,lat_max_ack=0.0,lat_avg_open_fill=0.0,lat_max_open_fill=0.0;
+            double lat_avg_fill_close=0.0,lat_max_fill_close=0.0;
+            lat_order_ack_.snapshot_and_reset(lat_n_ack,lat_avg_ack,lat_max_ack);
+            lat_open_fill_.snapshot_and_reset(lat_n_open_fill,lat_avg_open_fill,lat_max_open_fill);
+            lat_fill_close_.snapshot_and_reset(lat_n_fill_close,lat_avg_fill_close,lat_max_fill_close);
             std::ostringstream oo;
             oo<<std::fixed<<std::setprecision(4)
               <<"[10s] ticks="<<(nw-last_ticks)
@@ -1530,6 +1596,15 @@ private:
               <<" lat_recv_n="<<lat_n_recv
               <<" lat_recv_avg_ms="<<lat_avg_recv
               <<" lat_recv_max_ms="<<lat_max_recv
+              <<" lat_ack_n="<<lat_n_ack
+              <<" lat_ack_avg_ms="<<lat_avg_ack
+              <<" lat_ack_max_ms="<<lat_max_ack
+              <<" lat_open_fill_n="<<lat_n_open_fill
+              <<" lat_open_fill_avg_ms="<<lat_avg_open_fill
+              <<" lat_open_fill_max_ms="<<lat_max_open_fill
+              <<" lat_fill_close_n="<<lat_n_fill_close
+              <<" lat_fill_close_avg_ms="<<lat_avg_fill_close
+              <<" lat_fill_close_max_ms="<<lat_max_fill_close
               <<" pnl="<<met_.getpnl()<<" USD"
               <<" dia="<<pnl_dia_<<" USD"
               <<" kill="<<kill_.load();
@@ -2037,11 +2112,25 @@ private:
                 // Actualizar estado de órdenes
                 if(bid_ok&&b_placed){
                     q.capas[ci].bid_viva=true;
+                    std::lock_guard<std::mutex> lkl(mlat_);
+                    auto it_oid=oid_sent_ts_.find(new_boids[ci]);
+                    if(it_oid!=oid_sent_ts_.end()){
+                        uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now()-it_oid->second).count();
+                        lat_order_ack_.add_us(dt_us);
+                    }
                 } else if(bid_ok&&!b_placed){
                     q.capas[ci].bid_viva=false;q.capas[ci].bid_oid="";
                 }
                 if(ask_ok&&a_placed){
                     q.capas[ci].ask_viva=true;
+                    std::lock_guard<std::mutex> lkl(mlat_);
+                    auto it_oid=oid_sent_ts_.find(new_aoids[ci]);
+                    if(it_oid!=oid_sent_ts_.end()){
+                        uint64_t dt_us=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now()-it_oid->second).count();
+                        lat_order_ack_.add_us(dt_us);
+                    }
                 } else if(ask_ok&&!a_placed){
                     q.capas[ci].ask_viva=false;q.capas[ci].ask_oid="";
                 }
